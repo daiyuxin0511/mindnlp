@@ -1,4 +1,4 @@
-# Copyright 2021 Huawei Technologies Co., Ltd
+# Copyright 2023 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,23 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""
-Models init
-"""
-from . import albert, bert, gpt2, t5, ernie, roberta, gpt
-from .albert import *
-from .bert import *
-from .gpt import *
-from .gpt2 import *
-from .t5 import *
-from .ernie import *
-from .roberta import *
+"""Test Albert functions"""
+import pytest
 
-__all__ = []
-__all__.extend(albert.__all__)
-__all__.extend(bert.__all__)
-__all__.extend(gpt.__all__)
-__all__.extend(gpt2.__all__)
-__all__.extend(t5.__all__)
-__all__.extend(ernie.__all__)
-__all__.extend(roberta.__all__)
+from mindnlp.models import AlbertModel
+
+
+@pytest.mark.download
+def test_resize_embed():
+    """test from pretrained"""
+    model = AlbertModel.from_pretrained('albert-base-v1')
+    assert model.embeddings.word_embeddings.vocab_size == model.config.vocab_size
+    num_tokens = model.config.vocab_size
+    model.resize_token_embeddings(num_tokens + 1)
+    assert model.embeddings.word_embeddings.vocab_size == num_tokens + 1

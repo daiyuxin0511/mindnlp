@@ -16,8 +16,24 @@
 ALBERT model config
 """
 from mindnlp.abc import PreTrainedConfig
+from mindnlp.configs import MINDNLP_CONFIG_URL_BASE
 
 __all__ = ['AlbertConfig']
+
+ALBERT_SUPPORT_LIST = [
+    'albert-base-v1',
+    'albert-large-v1',
+    'albert-xlarge-v1',
+    'albert-xxlarge-v1',
+    'albert-base-v2',
+    'albert-large-v2',
+    'albert-xlarge-v2',
+    'albert-xxlarge-v2'
+]
+
+CONFIG_ARCHIVE_MAP = {
+    model: MINDNLP_CONFIG_URL_BASE.format('albert', model) for model in ALBERT_SUPPORT_LIST
+}
 
 
 class AlbertConfig(PreTrainedConfig):

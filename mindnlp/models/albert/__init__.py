@@ -12,3 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""
+Albert Model.
+"""
+from . import albert, albert_config
+from .albert import *
+from .albert_config import *
+
+__all__ = []
+__all__.extend(albert.__all__)
+__all__.extend(albert_config.__all__)

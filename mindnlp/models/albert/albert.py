@@ -13,16 +13,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
+# pylint: disable=C0415
+
 """MindNLP ALBERT model. """
+import logging
 import math
+import os
 import warnings
 import mindspore
 import mindspore.numpy as mnp
 from mindspore import nn
 from mindspore import ops
 from mindspore.common.initializer import initializer, TruncatedNormal, Normal
+from mindnlp._legacy.nn import Dropout, Matmul
 from mindnlp.abc import PreTrainedModel
-from .albert_config import AlbertConfig
+from mindnlp.configs import MINDNLP_MODEL_URL_BASE
+from .albert_config import AlbertConfig, ALBERT_SUPPORT_LIST
+from ..bert.bert import BertEmbeddings, BertSelfAttention
+
+__all__ = [
+    'AlbertEmbeddings', 'AlbertAttention', 'AlbertLayer', 'AlbertLayerGroup', 'AlbertTransformer',
+    'AlbertPretrainedModel', 'AlbertModel', 'AlbertForPretraining', 'AlbertMLMHead', 'AlbertSOPHead',
+    'AlbertForMaskedLM', 'AlbertForSequenceClassification', 'AlbertForTokenClassification',
+    'AlbertForQuestionAnswering', 'AlbertForMultipleChoice'
+]
 
 activation_map = {
     'relu': nn.ReLU(),
@@ -30,23 +45,60 @@ activation_map = {
     'gelu_new': nn.GELU(),
     'swish': nn.SiLU()
 }
+WEIGHTS_NAME = "mindspore.ckpt"
+logger = logging.getLogger(__name__)
+
+PRETRAINED_MODEL_ARCHIVE_MAP = {
+    model: MINDNLP_MODEL_URL_BASE.format('albert', model) for model in ALBERT_SUPPORT_LIST
+}
 
 
-class Matmul(nn.Cell):
-    r"""
-    Matmul Operation
-    """
-    def construct(self, a, b):
-        return ops.matmul(a, b)
+def torch_to_mindspore(pth_file, **kwargs):
+    """convert torch checkpoint to mindspore"""
+    _ = kwargs.get('prefix', '')
+
+    try:
+        import torch
+    except Exception as exc:
+        raise ImportError("'import torch' failed, please install torch by "
+                          "`pip install torch` or instructions from 'https://pytorch.org'") \
+                          from exc
+
+    from mindspore.train.serialization import save_checkpoint
+
+    logging.info('Starting checkpoint conversion.')
+    ms_ckpt = []
+    state_dict = torch.load(pth_file, map_location=torch.device('cpu'))
+
+    for key, value in state_dict.items():
+        if 'LayerNorm' in key:
+            key = key.replace('LayerNorm', 'layer_norm')
+        if 'layer_norm' in key:
+            if '.weight' in key:
+                key = key.replace('.weight', '.gamma')
+            if '.bias' in key:
+                key = key.replace('.bias', '.beta')
+        if 'embeddings' in key:
+            key = key.replace('weight', 'embedding_table')
+        ms_ckpt.append({'name': key, 'data': mindspore.Tensor(value.numpy())})
+
+    ms_ckpt_path = pth_file.replace('pytorch_model.bin','mindspore.ckpt')
+    if not os.path.exists(ms_ckpt_path):
+        try:
+            save_checkpoint(ms_ckpt, ms_ckpt_path)
+        except Exception as exc:
+            raise RuntimeError(f'Save checkpoint to {ms_ckpt_path} failed, '
+                               f'please checkout the path.') from exc
+
+    return ms_ckpt_path
 
 
-class AlbertEmbeddings(nn.Cell):
+class AlbertEmbeddings(BertEmbeddings):
     """
     Construct the embeddings from word, position and token_type embeddings.
     """
-
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         self.word_embeddings = nn.Embedding(
             config.vocab_size,
             config.embedding_size,
@@ -63,69 +115,35 @@ class AlbertEmbeddings(nn.Cell):
         self.layer_norm = nn.LayerNorm(
             (config.embedding_size,),
             epsilon=config.layer_norm_eps)
-        self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
-
-    def construct(self, input_ids, token_type_ids=None, position_ids=None):
-        seq_len = input_ids.shape[1]
-        if position_ids is None:
-            position_ids = mnp.arange(seq_len)
-            position_ids = position_ids.expand_dims(0).expand_as(input_ids)
-        if token_type_ids is None:
-            token_type_ids = ops.zeros_like(input_ids)
-
-        words_embeddings = self.word_embeddings(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-        embeddings = words_embeddings + position_embeddings + token_type_embeddings
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-        return embeddings
+        self.dropout = Dropout(config.hidden_dropout_prob)
 
 
-class AlbertAttention(nn.Cell):
+class AlbertAttention(BertSelfAttention):
     """
     Albert attention
     """
     def __init__(self, config):
-        super().__init__()
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
-            raise ValueError(
-                f"The hidden size {config.hidden_size} is not a multiple of the number of attention "
-                f"heads {config.num_attention_heads}"
-            )
+        super().__init__(config)
+        self.output_attentions = config.output_attentions
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Dense(config.hidden_size, self.all_head_size)
-        self.key = nn.Dense(config.hidden_size, self.all_head_size)
-        self.value = nn.Dense(config.hidden_size, self.all_head_size)
-
         self.hidden_size = config.hidden_size
-        self.dropout = nn.Dropout(p=config.attention_probs_dropout_prob)
+        self.dropout = Dropout(config.attention_probs_dropout_prob)
         self.dense = nn.Dense(config.hidden_size, config.hidden_size)
         self.layer_norm = nn.LayerNorm((config.hidden_size,), epsilon=config.layer_norm_eps)
         self.pruned_heads = set()
         self.matmul = Matmul()
 
-    def transpose_for_scores(self, input_x):
-        """
-        transpose
-        """
-        new_x_shape = input_x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        input_x = input_x.view(*new_x_shape)
-        return input_x.permute(0, 2, 1, 3)
-
-    def construct(self, input_ids, attention_mask=None, head_mask=None, output_attentions=False):
-        mixed_query_layer = self.query(input_ids)
-        mixed_key_layer = self.key(input_ids)
-        mixed_value_layer = self.value(input_ids)
+    def construct(self, hidden_states, attention_mask=None, head_mask=None):
+        mixed_query_layer = self.query(hidden_states)
+        mixed_key_layer = self.key(hidden_states)
+        mixed_value_layer = self.value(hidden_states)
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = self.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = self.matmul(query_layer, key_layer.swapaxes(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
@@ -154,8 +172,8 @@ class AlbertAttention(nn.Cell):
 
         projected_context_layer = ops.einsum("bfnd,ndh->bfh", context_layer, context_layer_w) + context_layer_b
         projected_context_layer_dropout = self.dropout(projected_context_layer)
-        layernormed_context_layer = self.LayerNorm(input_ids + projected_context_layer_dropout)
-        return (layernormed_context_layer, attention_probs) if output_attentions else (layernormed_context_layer,)
+        layernormed_context_layer = self.layer_norm(hidden_states + projected_context_layer_dropout)
+        return (layernormed_context_layer, attention_probs) if self.output_attentions else (layernormed_context_layer,)
 
 
 class AlbertLayer(nn.Cell):
@@ -171,10 +189,8 @@ class AlbertLayer(nn.Cell):
         self.ffn_output = nn.Dense(config.intermediate_size, config.hidden_size)
         self.activation = activation_map[config.hidden_act]
 
-    def construct(
-            self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False
-    ):
-        attention_output = self.attention(hidden_states, attention_mask, head_mask, output_attentions)
+    def construct(self, hidden_states, attention_mask=None, head_mask=None):
+        attention_output = self.attention(hidden_states, attention_mask, head_mask)
         ffn_output = self.ffn(attention_output[0])
         ffn_output = self.activation(ffn_output)
         ffn_output = self.ffn_output(ffn_output)
@@ -191,26 +207,12 @@ class AlbertLayerGroup(nn.Cell):
         super().__init__()
         self.albert_layers = nn.CellList([AlbertLayer(config) for _ in range(config.inner_group_num)])
 
-    def construct(
-            self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False,
-            output_hidden_states=False
-    ):
-        layer_hidden_states = ()
-        layer_attentions = ()
-
+    def construct(self, hidden_states, attention_mask=None, head_mask=None):
         for layer_index, albert_layer in enumerate(self.albert_layers):
-            layer_output = albert_layer(hidden_states, attention_mask, head_mask[layer_index], output_attentions)
+            layer_output = albert_layer(hidden_states, attention_mask, head_mask[layer_index])
             hidden_states = layer_output[0]
-            if output_attentions:
-                layer_attentions = layer_attentions + (layer_output[1],)
-            if output_hidden_states:
-                layer_hidden_states = layer_hidden_states + (hidden_states,)
 
         outputs = (hidden_states,)
-        if output_hidden_states:
-            outputs = outputs + (layer_hidden_states,)
-        if output_attentions:
-            outputs = outputs + (layer_attentions,)
         return outputs  # last-layer hidden state, (layer hidden states), (layer attentions)
 
 
@@ -224,15 +226,8 @@ class AlbertTransformer(nn.Cell):
         self.embedding_hidden_mapping_in = nn.Dense(config.embedding_size, config.hidden_size)
         self.albert_layer_groups = nn.CellList([AlbertLayerGroup(config) for _ in range(config.num_hidden_groups)])
 
-    def construct(
-            self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False,
-            output_hidden_states=False
-    ):
+    def construct(self, hidden_states, attention_mask=None, head_mask=None):
         hidden_states = self.embedding_hidden_mapping_in(hidden_states)
-        all_attentions = ()
-        if output_hidden_states:
-            all_hidden_states = (hidden_states,)
-
         for i in range(self.config.num_hidden_layers):
             # Number of layers in a hidden group
             layers_per_group = int(self.config.num_hidden_layers / self.config.num_hidden_groups)
@@ -243,20 +238,10 @@ class AlbertTransformer(nn.Cell):
                 hidden_states,
                 attention_mask,
                 head_mask[group_idx * layers_per_group: (group_idx + 1) * layers_per_group],
-                output_attentions,
-                output_hidden_states,
             )
             hidden_states = layer_group_output[0]
-            if output_attentions:
-                all_attentions = all_attentions + layer_group_output[-1]
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
 
         outputs = (hidden_states,)
-        if output_hidden_states:
-            outputs = outputs + (all_hidden_states,)
-        if output_attentions:
-            outputs = outputs + (all_attentions,)
         return outputs  # last-layer hidden state, (all hidden states), (all attentions)
 
 
@@ -266,6 +251,8 @@ class AlbertPretrainedModel(PreTrainedModel):
     """
     config_class = AlbertConfig
     base_model_prefix = "albert"
+    convert_torch_to_mindspore = torch_to_mindspore
+    pretrained_model_archive_map = PRETRAINED_MODEL_ARCHIVE_MAP
 
     def _init_weights(self, cell):
         """ Initialize the weights."""
@@ -334,40 +321,23 @@ class AlbertModel(AlbertPretrainedModel):
             token_type_ids=None,
             position_ids=None,
             head_mask=None,
-            inputs_embeds=None,
-            output_attentions=None,
-            output_hidden_states=None,
     ):
         """construct"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        if input_ids is not None:
-            input_shape = input_ids.shape
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.shape[:-1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-
         if attention_mask is None:
-            attention_mask = ops.ones(input_shape)
+            attention_mask = ops.ones_like(input_ids)
         if token_type_ids is None:
-            token_type_ids = ops.zeros(input_shape)
+            token_type_ids = ops.zeros_like(input_ids)
 
         extended_attention_mask = attention_mask.expand_dims(1).expand_dims(2)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         if head_mask is not None:
             if head_mask.ndim == 1:
                 head_mask = head_mask.expand_dims(0).expand_dims(0).expand_dims(-1).expand_dims(-1)
-                head_mask = mnp.broadcast_to(head_mask, (self.num_hidden_layers, -1, -1, -1, -1))
+                head_mask = mnp.broadcast_to(head_mask, (self.config.num_hidden_layers, -1, -1, -1, -1))
             elif head_mask.ndim == 2:
                 head_mask = head_mask.expand_dims(1).expand_dims(-1).expand_dims(-1)
         else:
-            head_mask = [None] * self.num_hidden_layers
+            head_mask = [None] * self.config.num_hidden_layers
 
         embedding_output = self.embeddings(
             input_ids,
@@ -378,8 +348,6 @@ class AlbertModel(AlbertPretrainedModel):
             embedding_output,
             extended_attention_mask,
             head_mask=head_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
         )
 
         sequence_output = encoder_outputs[0]
@@ -487,7 +455,7 @@ class AlbertMLMHead(nn.Cell):
     def construct(self, hidden_states):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.activation(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
+        hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.decoder(hidden_states)
         prediction_scores = hidden_states
         return prediction_scores
